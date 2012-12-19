@@ -9,7 +9,7 @@ import logging
 import threading
 from socket import socket, gethostname, AF_INET, SOCK_DGRAM
 
-from zookeeper import EPHEMERAL, NoNodeException, ConnectionLossException
+from zookeeper import EPHEMERAL, NoNodeException, ConnectionLossException, OperationTimeoutException
 import zc.zk
 from watchdog.observers import Observer
 
@@ -41,19 +41,21 @@ class ZkFarmExporter(ZkFarmWatcher):
         while True:
             with self.cv:
                 try:
-                    node_names = zkconn.get_children(root_node_path, self.get_watcher(root_node_path))
-                except NoNodeException:
-                    zkconn.create_recursive(root_node_path, '', zc.zk.OPEN_ACL_UNSAFE)
-                    continue
-                except ConnectionLossException:
+                    try:
+                        node_names = zkconn.get_children(root_node_path, self.get_watcher(root_node_path))
+                    except NoNodeException:
+                        zkconn.create_recursive(root_node_path, '', zc.zk.OPEN_ACL_UNSAFE)
+                        continue
+                    new_conf = {}
+                    for name in node_names:
+                        subnode_path = '%s/%s' % (root_node_path, name)
+                        info = unserialize(zkconn.get(subnode_path, self.get_watcher(subnode_path))[0])
+                        if not filter_handler or filter_handler(info):
+                            new_conf[name] = info
+                except (ConnectionLossException, OperationTimeoutException):
+                    logging.warn('Connection to zookeeper lost while looking for changes')
                     self.wait()
                     continue
-                new_conf = {}
-                for name in node_names:
-                    subnode_path = '%s/%s' % (root_node_path, name)
-                    info = unserialize(zkconn.get(subnode_path, self.get_watcher(subnode_path))[0])
-                    if not filter_handler or filter_handler(info):
-                        new_conf[name] = info
                 conf.write(new_conf)
                 if updated_handler:
                     updated_handler()
@@ -106,17 +108,22 @@ class ZkFarmJoiner(ZkFarmWatcher):
                 if current_conf != new_conf:
                     logging.info('Local conf changed')
                     self.zkconn.set(self.node_path, serialize(new_conf))
-            except ConnectionLossException:
+            except (ConnectionLossException, OperationTimeoutException):
+                logging.warn('Connection to zookeeper lost while dispatching changes')
                 pass
             self.notify()
 
     def node_watcher(self, handle, type, state, path):
         with self.cv:
-            current_conf = self.conf.read()
-            new_conf = unserialize(self.zkconn.get(self.node_path, self.node_watcher)[0])
-            if current_conf != new_conf:
-                logging.info('Remote conf changed')
-                self.conf.write(new_conf)
+            try:
+                current_conf = self.conf.read()
+                new_conf = unserialize(self.zkconn.get(self.node_path, self.node_watcher)[0])
+                if current_conf != new_conf:
+                    logging.info('Remote conf changed')
+                    self.conf.write(new_conf)
+            except (ConnectionLossException, OperationTimeoutException):
+                logging.warn('Connection to zookeeper lost while watching for changes')
+                pass
             self.notify()
 
     def myip(self):
